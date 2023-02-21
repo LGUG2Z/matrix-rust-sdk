@@ -81,6 +81,7 @@ mod tests {
             api::client::error::ErrorKind as RumaError,
             events::room::message::RoomMessageEventContent, UInt,
         },
+        sliding_sync,
         test_utils::force_sliding_sync_pos,
         SlidingSyncMode, SlidingSyncState, SlidingSyncView,
     };
@@ -1320,6 +1321,213 @@ mod tests {
             event_id,
             "Latest event is different than what we've sent"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn running_consecutive_requests_increments_pos() -> anyhow::Result<()> {
+        let (client, sync_builder) = random_setup_with_rooms(1).await?;
+
+        // List one room.
+        let room_id = {
+            let sync = sync_builder
+                .clone()
+                .add_view(
+                    SlidingSyncView::builder()
+                        .sync_mode(SlidingSyncMode::Selective)
+                        .add_range(0u32, 1)
+                        .timeline_limit(0u32)
+                        .name("init_view")
+                        .build()?,
+                )
+                .build()
+                .await?;
+
+            // Get the sync stream.
+            let stream = sync.stream();
+            pin_mut!(stream);
+
+            // Get the view to all rooms to check the view' state.
+            let view = sync.view("init_view").context("View `init_view` isn't found")?;
+            assert_eq!(view.state(), SlidingSyncState::Cold);
+
+            // Send the request and wait for a response.
+            let update_summary = stream
+                .next()
+                .await
+                .context("No room summary found, loop ended unsuccessfully")??;
+
+            // Check the state has switched to `Live`.
+            assert_eq!(view.state(), SlidingSyncState::Live);
+
+            // One room has received an update.
+            assert_eq!(update_summary.rooms.len(), 1);
+
+            // Let's fetch the room ID then.
+            let room_id = update_summary.rooms[0].clone();
+
+            // Let's fetch the room ID from the view too.
+            assert_matches!(view.rooms_list().get(0), Some(RoomListEntry::Filled(same_room_id)) => {
+                assert_eq!(same_room_id, &room_id);
+            });
+
+            room_id
+        };
+
+        // Join a room and send 20 messages.
+        {
+            // Join the room.
+            let room =
+                client.get_joined_room(&room_id).context("Failed to join room `{room_id}`")?;
+
+            // In this room, let's send 20 messages!
+            for nth in 0..20 {
+                let message = RoomMessageEventContent::text_plain(format!("Message #{nth}"));
+
+                room.send(message, None).await?;
+            }
+
+            // Wait on the server to receive all the messages.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+
+        let sync = sync_builder
+            .clone()
+            .add_view(
+                SlidingSyncView::builder()
+                    .sync_mode(SlidingSyncMode::Selective)
+                    .name("visible_rooms_view")
+                    .add_range(0u32, 1)
+                    .timeline_limit(1u32)
+                    .build()?,
+            )
+            .build()
+            .await?;
+
+        // Run the first request
+        let stream = sync.stream();
+        pin_mut!(stream);
+        stream.next().await.context("No update summary found, loop ended unsuccessfully")??;
+
+        let pos = sync.pos.get_cloned().unwrap();
+
+        assert_eq!(pos, "1");
+
+        // Change the limit so the next requests doesn't stall
+        let view =
+            sync.view("visible_rooms_view").context("View `visible_rooms_view` isn't found")?;
+        view.timeline_limit.set(Some(UInt::try_from(20u32).unwrap()));
+
+        // Run the next request
+        let stream = sync.stream();
+        pin_mut!(stream);
+        stream.next().await.context("No update summary found, loop ended unsuccessfully")??;
+
+        let pos = sync.pos.get_cloned().unwrap();
+
+        assert_eq!(pos, "2");
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn running_concurrent_requests_increments_pos() -> anyhow::Result<()> {
+        let (client, sync_builder) = random_setup_with_rooms(1).await?;
+
+        // List one room.
+        let room_id = {
+            let sync = sync_builder
+                .clone()
+                .add_view(
+                    SlidingSyncView::builder()
+                        .sync_mode(SlidingSyncMode::Selective)
+                        .add_range(0u32, 1)
+                        .timeline_limit(0u32)
+                        .name("init_view")
+                        .build()?,
+                )
+                .build()
+                .await?;
+
+            // Get the sync stream.
+            let stream = sync.stream();
+            pin_mut!(stream);
+
+            // Get the view to all rooms to check the view' state.
+            let view = sync.view("init_view").context("View `init_view` isn't found")?;
+            assert_eq!(view.state(), SlidingSyncState::Cold);
+
+            // Send the request and wait for a response.
+            let update_summary = stream
+                .next()
+                .await
+                .context("No room summary found, loop ended unsuccessfully")??;
+
+            // Check the state has switched to `Live`.
+            assert_eq!(view.state(), SlidingSyncState::Live);
+
+            // One room has received an update.
+            assert_eq!(update_summary.rooms.len(), 1);
+
+            // Let's fetch the room ID then.
+            let room_id = update_summary.rooms[0].clone();
+
+            // Let's fetch the room ID from the view too.
+            assert_matches!(view.rooms_list().get(0), Some(RoomListEntry::Filled(same_room_id)) => {
+                assert_eq!(same_room_id, &room_id);
+            });
+
+            room_id
+        };
+
+        // Join a room and send 20 messages.
+        {
+            // Join the room.
+            let room =
+                client.get_joined_room(&room_id).context("Failed to join room `{room_id}`")?;
+
+            // In this room, let's send 20 messages!
+            for nth in 0..20 {
+                let message = RoomMessageEventContent::text_plain(format!("Message #{nth}"));
+
+                room.send(message, None).await?;
+            }
+
+            // Wait on the server to receive all the messages.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+
+        let sync = sync_builder
+            .clone()
+            .add_view(
+                SlidingSyncView::builder()
+                    .sync_mode(SlidingSyncMode::Selective)
+                    .name("visible_rooms_view")
+                    .add_range(0u32, 1)
+                    .timeline_limit(1u32)
+                    .build()?,
+            )
+            .build()
+            .await?;
+
+        for nth in 0..100 {
+            let sync_clone = sync.clone();
+
+            tokio::spawn(async move {
+                dbg!("Running the {} one", nth);
+                let stream = sync_clone.stream();
+                pin_mut!(stream);
+
+                stream.next().await;
+            });
+        }
+
+        // Wait for all the requests to finish.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        let pos = sync.pos.get_cloned().unwrap();
+        assert_ne!(pos, "1");
 
         Ok(())
     }

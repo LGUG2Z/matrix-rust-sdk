@@ -765,7 +765,7 @@ pub struct SlidingSync {
     storage_key: Option<String>,
 
     // ------ Internal state
-    pub(crate) pos: Mutable<Option<String>>,
+    pub pos: Mutable<Option<String>>,
     delta_token: Mutable<Option<String>>,
 
     /// The views of this sliding sync instance
