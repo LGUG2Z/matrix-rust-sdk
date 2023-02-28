@@ -338,6 +338,11 @@ dictionary EncryptionSettings {
     boolean only_allow_trusted_devices;
 };
 
+dictionary RoomSettings {
+    EventEncryptionAlgorithm algorithm;
+    boolean only_allow_trusted_devices;
+};
+
 interface OlmMachine {
     [Throws=CryptoStoreError]
     constructor(
@@ -387,24 +392,22 @@ interface OlmMachine {
     Request? get_missing_sessions(sequence<string> users);
 
     [Throws=CryptoStoreError]
-    EncryptionSettings? get_encryption_settings([ByRef] string room_id);
+    RoomSettings? get_room_settings([ByRef] string room_id);
+    [Throws=CryptoStoreError]
+    void set_room_algorithm([ByRef] string room_id, EventEncryptionAlgorithm algorithm);
+    [Throws=CryptoStoreError]
+    void set_room_only_allow_trusted_devices([ByRef] string room_id, boolean only_allow_trusted_devices);
 
     [Throws=CryptoStoreError]
-    void set_event_encryption_algorithm([ByRef] string room_id, EventEncryptionAlgorithm algorithm);
-
+    boolean get_only_allow_trusted_devices();
     [Throws=CryptoStoreError]
-    void set_block_untrusted_devices_per_room([ByRef] string room_id, boolean block_untrusted_devices);
-
-    [Throws=CryptoStoreError]
-    void set_block_untrusted_devices_globally(boolean block_untrusted_devices);
-
-    [Throws=CryptoStoreError]
-    boolean is_blocking_untrusted_devices_globally();
+    void set_only_allow_trusted_devices(boolean only_allow_trusted_devices);
 
     [Throws=CryptoStoreError]
     sequence<Request> share_room_key(
         [ByRef] string room_id,
-        sequence<string> users
+        sequence<string> users,
+        EncryptionSettings settings
     );
 
     [Throws=CryptoStoreError]
