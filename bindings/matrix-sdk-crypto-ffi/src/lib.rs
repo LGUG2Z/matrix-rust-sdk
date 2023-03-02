@@ -74,6 +74,8 @@ pub struct MigrationData {
     cross_signing: CrossSigningKeyExport,
     /// The list of users that the Rust SDK should track.
     tracked_users: Vec<String>,
+    /// Map of room settings
+    room_settings: HashMap<String, RoomSettings>,
 }
 
 /// A pickled version of an `Account`.
@@ -153,17 +155,17 @@ impl From<anyhow::Error> for MigrationError {
     }
 }
 
-/// Migrate a libolm based setup to a vodozemac based setup stored in a Sled
+/// Migrate a libolm based setup to a vodozemac based setup stored in a Sqlite
 /// store.
 ///
 /// # Arguments
 ///
-/// * `data` - The data that should be migrated over to the Sled store.
+/// * `data` - The data that should be migrated over to the Sqlite store.
 ///
-/// * `path` - The path where the Sled store should be created.
+/// * `path` - The path where the Sqlite store should be created.
 ///
 /// * `passphrase` - The passphrase that should be used to encrypt the data at
-/// rest in the Sled store. **Warning**, if no passphrase is given, the store
+/// rest in the Sqlite store. **Warning**, if no passphrase is given, the store
 /// and all its data will remain unencrypted.
 ///
 /// * `progress_listener` - A callback that can be used to introspect the
@@ -178,6 +180,48 @@ pub fn migrate(
     let runtime = Runtime::new()?;
     runtime.block_on(async move {
         migrate_data(data, path, passphrase, progress_listener).await?;
+        Ok(())
+    })
+}
+
+/// Migrate room settings, including room algorithm and whether to block
+/// untrusted devices from legacy store to Sqlite store.
+///
+/// Note that this method should only be used if a client has already migrated
+/// account data via [migrate](#method.migrate) method, which did not include
+/// room settings. For a brand new migration, the [migrate](#method.migrate)
+/// method will take care of room settings automatically, if provided.
+///
+/// # Arguments
+///
+/// * `room_settings` - Map of room settings
+///
+/// * `path` - The path where the Sqlite store should be created.
+///
+/// * `passphrase` - The passphrase that should be used to encrypt the data at
+/// rest in the Sqlite store. **Warning**, if no passphrase is given, the store
+/// and all its data will remain unencrypted.
+pub fn migrate_room_settings(
+    room_settings: HashMap<String, RoomSettings>,
+    path: &str,
+    passphrase: Option<String>,
+) -> anyhow::Result<()> {
+    use matrix_sdk_crypto::store::{Changes as RustChanges, CryptoStore};
+    use tokio::runtime::Runtime;
+
+    let runtime = Runtime::new()?;
+    runtime.block_on(async move {
+        let store = SqliteCryptoStore::open(path, passphrase.as_deref()).await?;
+
+        let mut rust_settings = HashMap::new();
+        for (room_id, settings) in room_settings {
+            let room_id = RoomId::parse(room_id)?;
+            rust_settings.insert(room_id, settings.into());
+        }
+
+        let changes = RustChanges { room_settings: rust_settings, ..Default::default() };
+        store.save_changes(changes).await?;
+
         Ok(())
     })
 }
@@ -337,6 +381,12 @@ async fn migrate_data(
     processed_steps += 1;
     listener(processed_steps, total_steps);
 
+    let mut room_settings = HashMap::new();
+    for (room_id, settings) in data.room_settings {
+        let room_id = RoomId::parse(room_id)?;
+        room_settings.insert(room_id, settings.into());
+    }
+
     let changes = RustChanges {
         account: Some(account),
         private_identity: Some(cross_signing),
@@ -344,6 +394,7 @@ async fn migrate_data(
         inbound_group_sessions,
         recovery_key,
         backup_version: data.backup_version,
+        room_settings,
         ..Default::default()
     };
     store.save_changes(changes).await?;
@@ -373,6 +424,7 @@ impl<T: Fn(i32, i32)> ProgressListener for T {
 }
 
 /// An encryption algorithm to be used to encrypt messages sent to a room.
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
 pub enum EventEncryptionAlgorithm {
     /// Olm version 1 using Curve25519, AES-256, and SHA-256.
     OlmV1Curve25519AesSha2,
@@ -602,6 +654,7 @@ impl From<matrix_sdk_crypto::CrossSigningStatus> for CrossSigningStatus {
 }
 
 /// Room encryption settings which are modified by state events or user options
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
 pub struct RoomSettings {
     /// The encryption algorithm that should be used in the room.
     pub algorithm: EventEncryptionAlgorithm,
@@ -651,7 +704,7 @@ mod test {
     use tempfile::tempdir;
 
     use super::MigrationData;
-    use crate::{migrate, OlmMachine};
+    use crate::{migrate, OlmMachine, RoomSettings, EventEncryptionAlgorithm};
 
     #[test]
     fn android_migration() -> Result<()> {
@@ -734,7 +787,17 @@ mod test {
                "@this-is-me:matrix.org",
                "@Amandine:matrix.org",
                "@ganfra:matrix.org"
-            ]
+            ],
+            "room_settings": {
+                "!AZkqtjvtwPAuyNOXEt:matrix.org": {
+                    "algorithm": "OlmV1Curve25519AesSha2",
+                    "only_allow_trusted_devices": true
+                },
+                "!CWLUCoEWXSFyTCOtfL:matrix.org": {
+                    "algorithm": "MegolmV1AesSha2",
+                    "only_allow_trusted_devices": false
+                },
+            }
         });
 
         let migration_data: MigrationData = serde_json::from_value(data)?;
@@ -762,6 +825,15 @@ mod test {
 
         let backup_keys = machine.get_backup_keys()?;
         assert!(backup_keys.is_some());
+
+        let settings1 = machine.get_room_settings("!AZkqtjvtwPAuyNOXEt:matrix.org")?;
+        assert_eq!(Some(RoomSettings { algorithm: EventEncryptionAlgorithm::OlmV1Curve25519AesSha2, only_allow_trusted_devices: true }), settings1);
+
+        let settings2 = machine.get_room_settings("!CWLUCoEWXSFyTCOtfL:matrix.org")?;
+        assert_eq!(Some(RoomSettings { algorithm: EventEncryptionAlgorithm::MegolmV1AesSha2, only_allow_trusted_devices: false }), settings2);
+
+        let settings3 = machine.get_room_settings("!XYZ:matrix.org")?;
+        assert!(settings3.is_none());        
 
         Ok(())
     }
