@@ -13,6 +13,8 @@
 // limitations under the License.
 
 use deadpool_sqlite::{CreatePoolError, PoolError};
+#[cfg(feature = "state-store")]
+use matrix_sdk_base::store::StoreError as StateStoreError;
 #[cfg(feature = "crypto-store")]
 use matrix_sdk_crypto::CryptoStoreError;
 use thiserror::Error;
@@ -91,6 +93,13 @@ impl_from!(matrix_sdk_store_encryption::Error => Error::Encryption);
 impl From<Error> for CryptoStoreError {
     fn from(e: Error) -> Self {
         CryptoStoreError::backend(e)
+    }
+}
+
+#[cfg(feature = "state-store")]
+impl From<Error> for StateStoreError {
+    fn from(e: Error) -> Self {
+        StateStoreError::backend(e)
     }
 }
 
